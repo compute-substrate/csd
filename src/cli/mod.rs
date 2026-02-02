@@ -1,0 +1,601 @@
+// src/cli/main.rs
+use anyhow::Result;
+use clap::{ArgAction, Parser, Subcommand};
+use std::sync::Arc;
+
+use crate::state::db::Stores;
+
+#[derive(Parser)]
+#[command(
+    name = "csd",
+    version = "0.1.0",
+    about = "Compute Substrate daemon + wallet",
+    arg_required_else_help = true
+)]
+pub struct Cmd {
+    #[command(subcommand)]
+    pub cmd: Commands,
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    Genesis {
+        #[arg(long, default_value = "genesis.bin")]
+        out: String,
+
+        #[arg(long, default_value = "0x0000000000000000000000000000000000000000")]
+        burn_addr20: String,
+    },
+
+    Node {
+        #[arg(long, default_value = "cs.db")]
+        datadir: String,
+
+        #[arg(long, default_value = "127.0.0.1:8789")]
+        rpc: String,
+
+        #[arg(long)]
+        mine: bool,
+
+        #[arg(long, default_value = "")]
+        miner_addr20: String,
+
+        // ---- P2P ----
+        #[arg(long, default_value = "genesis.bin")]
+        genesis: String,
+
+        #[arg(long, default_value = "/ip4/0.0.0.0/tcp/17999")]
+        p2p_listen: String,
+
+        #[arg(long, default_value = "")]
+        bootnodes: String,
+    },
+
+    Wallet {
+        #[command(subcommand)]
+        w: WalletCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WalletCmd {
+    New,
+    Addr {
+        #[arg(long)]
+        privkey: String,
+    },
+    Whoami {
+        #[arg(long)]
+        privkey: String,
+    },
+    Input {
+        #[arg(long)]
+        privkey: Option<String>,
+        #[arg(long)]
+        address: Option<String>,
+        #[arg(long, default_value = "cs.db")]
+        datadir: String,
+        #[arg(long, default_value_t = 0)]
+        min: u64,
+        #[arg(long)]
+        smallest: bool,
+    },
+    Balance {
+        #[arg(long)]
+        address: String,
+        #[arg(long, default_value = "cs.db")]
+        datadir: String,
+    },
+    Spend {
+        #[arg(long)]
+        privkey: String,
+        #[arg(long, action = ArgAction::Append)]
+        input: Vec<String>,
+        #[arg(long)]
+        auto_input: bool,
+        #[arg(long, default_value_t = 0)]
+        min_input: u64,
+        #[arg(long, default_value = "cs.db")]
+        datadir: String,
+        #[arg(long, action = ArgAction::Append)]
+        output: Vec<String>,
+        #[arg(long)]
+        fee: u64,
+        #[arg(long)]
+        change: Option<String>,
+    },
+    Propose {
+        #[arg(long)]
+        privkey: String,
+        #[arg(long, action = ArgAction::Append)]
+        input: Vec<String>,
+        #[arg(long)]
+        auto_input: bool,
+        #[arg(long, default_value_t = 0)]
+        min_input: u64,
+        #[arg(long, default_value = "cs.db")]
+        datadir: String,
+        #[arg(long)]
+        fee: u64,
+        #[arg(long)]
+        change: Option<String>,
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        payload_hash: String,
+        #[arg(long)]
+        uri: String,
+        #[arg(long)]
+        expires_epoch: u64,
+    },
+    Attest {
+        #[arg(long)]
+        privkey: String,
+        #[arg(long, action = ArgAction::Append)]
+        input: Vec<String>,
+        #[arg(long)]
+        auto_input: bool,
+        #[arg(long, default_value_t = 0)]
+        min_input: u64,
+        #[arg(long, default_value = "cs.db")]
+        datadir: String,
+        #[arg(long)]
+        fee: u64,
+        #[arg(long)]
+        change: Option<String>,
+        #[arg(long)]
+        proposal_id: String,
+        #[arg(long)]
+        score: u32,
+        #[arg(long)]
+        confidence: u32,
+    },
+    ProposeSubmit {
+        #[arg(long)]
+        privkey: String,
+        #[arg(long, action = ArgAction::Append)]
+        input: Vec<String>,
+        #[arg(long)]
+        auto_input: bool,
+        #[arg(long, default_value_t = 0)]
+        min_input: u64,
+        #[arg(long, default_value = "cs.db")]
+        datadir: String,
+        #[arg(long)]
+        fee: u64,
+        #[arg(long)]
+        change: Option<String>,
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        payload_hash: String,
+        #[arg(long)]
+        uri: String,
+        #[arg(long)]
+        expires_epoch: u64,
+        #[arg(long, default_value = "http://127.0.0.1:8789")]
+        rpc_url: String,
+    },
+    AttestSubmit {
+        #[arg(long)]
+        privkey: String,
+        #[arg(long, action = ArgAction::Append)]
+        input: Vec<String>,
+        #[arg(long)]
+        auto_input: bool,
+        #[arg(long, default_value_t = 0)]
+        min_input: u64,
+        #[arg(long, default_value = "cs.db")]
+        datadir: String,
+        #[arg(long)]
+        fee: u64,
+        #[arg(long)]
+        change: Option<String>,
+        #[arg(long)]
+        proposal_id: String,
+        #[arg(long)]
+        score: u32,
+        #[arg(long)]
+        confidence: u32,
+        #[arg(long, default_value = "http://127.0.0.1:8789")]
+        rpc_url: String,
+    },
+}
+
+/// Keep mempool consistent with the current canonical UTXO set.
+/// No “revalidate()” assumptions — just prune using your existing implementation.
+fn prune_mempool(db: &Arc<Stores>, mempool: &Arc<crate::net::mempool::Mempool>) {
+    let n = mempool.prune(db.as_ref());
+    if n > 0 {
+        eprintln!(
+            "[mempool] pruned {} txs (mempool_len={}, spent_outpoints={})",
+            n,
+            mempool.len(),
+            mempool.spent_len()
+        );
+    }
+}
+
+pub async fn run() -> Result<()> {
+    let cmd = Cmd::parse();
+
+    match cmd.cmd {
+        Commands::Wallet { w } => {
+            use crate::cli::wallet::*;
+
+            match w {
+                WalletCmd::New => wallet_new()?,
+
+                WalletCmd::Addr { privkey } => wallet_addr(&privkey)?,
+                WalletCmd::Whoami { privkey } => wallet_addr(&privkey)?,
+
+                WalletCmd::Input {
+                    privkey,
+                    address,
+                    datadir,
+                    min,
+                    smallest,
+                } => wallet_input(
+                    &datadir,
+                    privkey.as_deref(),
+                    address.as_deref(),
+                    min,
+                    smallest,
+                )?,
+
+                WalletCmd::Balance { address, datadir } => wallet_balance(&datadir, &address)?,
+
+                WalletCmd::Spend {
+                    privkey,
+                    mut input,
+                    auto_input,
+                    min_input,
+                    datadir,
+                    output,
+                    fee,
+                    change,
+                } => {
+                    if auto_input {
+                        if !input.is_empty() {
+                            anyhow::bail!("--auto-input cannot be combined with --input");
+                        }
+                        let picked = wallet_pick_input(&datadir, &privkey, min_input, false)?;
+                        input.push(picked);
+                    }
+                    // ✅ UPDATED: pass datadir into wallet_spend (CSD_SIG_V2 signer reads DB)
+                    wallet_spend(&datadir, &privkey, input, output, fee, change)?
+                }
+
+                WalletCmd::Propose {
+                    privkey,
+                    mut input,
+                    auto_input,
+                    min_input,
+                    datadir,
+                    fee,
+                    change,
+                    domain,
+                    payload_hash,
+                    uri,
+                    expires_epoch,
+                } => {
+                    if auto_input {
+                        if !input.is_empty() {
+                            anyhow::bail!("--auto-input cannot be combined with --input");
+                        }
+                        let picked = wallet_pick_input(&datadir, &privkey, min_input, false)?;
+                        input.push(picked);
+                    }
+
+                    // ✅ UPDATED: pass datadir
+                    wallet_propose(
+                        &datadir,
+                        &privkey,
+                        input,
+                        fee,
+                        change,
+                        domain,
+                        payload_hash,
+                        uri,
+                        expires_epoch,
+                    )?
+                }
+
+                WalletCmd::Attest {
+                    privkey,
+                    mut input,
+                    auto_input,
+                    min_input,
+                    datadir,
+                    fee,
+                    change,
+                    proposal_id,
+                    score,
+                    confidence,
+                } => {
+                    if auto_input {
+                        if !input.is_empty() {
+                            anyhow::bail!("--auto-input cannot be combined with --input");
+                        }
+                        let picked = wallet_pick_input(&datadir, &privkey, min_input, false)?;
+                        input.push(picked);
+                    }
+
+                    // ✅ UPDATED: pass datadir
+                    wallet_attest(
+                        &datadir,
+                        &privkey,
+                        input,
+                        fee,
+                        change,
+                        proposal_id,
+                        score,
+                        confidence,
+                    )?
+                }
+
+                WalletCmd::ProposeSubmit {
+                    privkey,
+                    mut input,
+                    auto_input,
+                    min_input,
+                    datadir,
+                    fee,
+                    change,
+                    domain,
+                    payload_hash,
+                    uri,
+                    expires_epoch,
+                    rpc_url,
+                } => {
+                    if auto_input {
+                        if !input.is_empty() {
+                            anyhow::bail!("--auto-input cannot be combined with --input");
+                        }
+                        let picked = wallet_pick_input(&datadir, &privkey, min_input, false)?;
+                        input.push(picked);
+                    }
+
+                    // ✅ UPDATED: pass datadir + rpc_url
+                    wallet_propose_submit(
+                        &datadir,
+                        &rpc_url,
+                        &privkey,
+                        input,
+                        fee,
+                        change,
+                        domain,
+                        payload_hash,
+                        uri,
+                        expires_epoch,
+                    )?
+                }
+
+                WalletCmd::AttestSubmit {
+                    privkey,
+                    mut input,
+                    auto_input,
+                    min_input,
+                    datadir,
+                    fee,
+                    change,
+                    proposal_id,
+                    score,
+                    confidence,
+                    rpc_url,
+                } => {
+                    if auto_input {
+                        if !input.is_empty() {
+                            anyhow::bail!("--auto-input cannot be combined with --input");
+                        }
+                        let picked = wallet_pick_input(&datadir, &privkey, min_input, false)?;
+                        input.push(picked);
+                    }
+
+                    // ✅ UPDATED: pass datadir + rpc_url
+                    wallet_attest_submit(
+                        &datadir,
+                        &rpc_url,
+                        &privkey,
+                        input,
+                        fee,
+                        change,
+                        proposal_id,
+                        score,
+                        confidence,
+                    )?
+                }
+            }
+
+            Ok(())
+        }
+
+        Commands::Genesis { out, burn_addr20 } => {
+            let s = burn_addr20.strip_prefix("0x").unwrap_or(&burn_addr20);
+            let bytes = hex::decode(s)?;
+            if bytes.len() != 20 {
+                anyhow::bail!("burn_addr20 must be 20 bytes hex");
+            }
+            let mut burn = [0u8; 20];
+            burn.copy_from_slice(&bytes);
+
+            let genesis = crate::chain::genesis::make_genesis_block(burn)?;
+            std::fs::write(&out, bincode::serialize(&genesis)?)?;
+            println!("wrote genesis to {out}");
+            let gh = crate::chain::index::header_hash(&genesis.header);
+            println!("genesis_hash: 0x{}", hex::encode(gh));
+            Ok(())
+        }
+
+        Commands::Node {
+            datadir,
+            rpc,
+            mine,
+            miner_addr20,
+            genesis,
+            p2p_listen,
+            bootnodes,
+        } => {
+            std::fs::create_dir_all(&datadir)?;
+            let db = Arc::new(Stores::open(&datadir)?);
+
+            let gbytes = std::fs::read(&genesis)?;
+            let gblock: crate::types::Block = bincode::deserialize(&gbytes)?;
+            crate::chain::genesis::ensure_genesis(db.clone(), gblock.clone())?;
+            let genesis_hash = crate::chain::index::header_hash(&gblock.header);
+
+            let mempool = Arc::new(crate::net::mempool::Mempool::new());
+
+            // MAINNET-CRITICAL: single chain write lock shared by miner + p2p sync
+            let chain_lock = crate::chain::lock::new_chain_lock();
+
+            let (tx_gossip_tx, tx_gossip_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::net::GossipTxEvent>();
+            let (mined_hdr_tx, mined_hdr_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::net::MinedHeaderEvent>();
+
+            // ✅ FIX: api::router expects UnboundedSender<GossipTxEvent>
+            let app = crate::api::router(db.clone(), mempool.clone(), tx_gossip_tx.clone());
+
+            let listener = tokio::net::TcpListener::bind(&rpc).await?;
+            println!("RPC on http://{}", rpc);
+
+            let listen_ma: libp2p::Multiaddr = p2p_listen.parse()?;
+            let boots: Vec<libp2p::Multiaddr> = if bootnodes.trim().is_empty() {
+                vec![]
+            } else {
+                bootnodes
+                    .split(',')
+                    .map(|s| s.trim().parse())
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+
+            let net_cfg = crate::net::node::NetConfig {
+                datadir: datadir.clone(),
+                listen: listen_ma,
+                bootnodes: boots,
+                genesis_hash,
+                is_bootnode: !mine,
+            };
+
+            tokio::spawn(crate::net::node::run_p2p(
+                db.clone(),
+                mempool.clone(),
+                net_cfg,
+                mined_hdr_rx,
+                tx_gossip_rx,
+                chain_lock.clone(),
+            ));
+
+            if mine {
+                if miner_addr20.trim().is_empty() {
+                    anyhow::bail!("--mine requires --miner-addr20 20-byte hex");
+                }
+
+                let mut addr = [0u8; 20];
+                let s = miner_addr20.strip_prefix("0x").unwrap_or(&miner_addr20);
+                let bytes = hex::decode(s)?;
+                if bytes.len() != 20 {
+                    anyhow::bail!("miner_addr20 must be 20 bytes hex");
+                }
+                addr.copy_from_slice(&bytes);
+
+                let db2 = db.clone();
+                let mp2 = mempool.clone();
+                let mined_tx = mined_hdr_tx.clone();
+                let chain_lock2 = chain_lock.clone();
+
+                tokio::spawn(async move {
+                    let max_mempool_txs: usize = 500;
+
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+                        // Keep mempool as a live view of canonical UTXO set
+                        prune_mempool(&db2, &mp2);
+
+                        let db3 = db2.clone();
+                        let mp3 = mp2.clone();
+                        let chain_lock3 = chain_lock2.clone();
+
+                        let mined_join = tokio::task::spawn_blocking(move || {
+                            crate::chain::mine::mine_one(
+                                db3.as_ref(),
+                                mp3.as_ref(),
+                                addr,
+                                max_mempool_txs,
+                                &chain_lock3,
+                            )
+                        })
+                        .await;
+
+                        let Ok(mined_res) = mined_join else {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
+                        };
+
+                        let Ok(bh) = mined_res else {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
+                        };
+
+                        let tip_now = crate::state::db::get_tip(db2.as_ref())
+                            .ok()
+                            .flatten()
+                            .unwrap_or([0u8; 32]);
+                        let accepted = tip_now == bh;
+
+                        let mut txs_in_block = 0usize;
+
+                        match db2.blocks.get(crate::state::db::k_block(&bh)) {
+                            Ok(Some(v)) => match bincode::deserialize::<crate::types::Block>(&v) {
+                                Ok(blk) => {
+                                    txs_in_block = blk.txs.len();
+                                    let _ = mined_tx.send(crate::net::MinedHeaderEvent {
+                                        hash: bh,
+                                        header: blk.header.clone(),
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[mine] warning: failed to deserialize block {}: {e}",
+                                        hex::encode(bh)
+                                    );
+                                }
+                            },
+                            Ok(None) => {
+                                eprintln!(
+                                    "[mine] warning: missing block bytes for {}",
+                                    hex::encode(bh)
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[mine] warning: db.blocks.get failed for {}: {e}",
+                                    hex::encode(bh)
+                                );
+                            }
+                        }
+
+                        // After tip update, prune again (fast, avoids stale spends)
+                        if accepted {
+                            prune_mempool(&db2, &mp2);
+                        }
+
+                        println!(
+                            "[mine] new block 0x{} (accepted_as_tip={}, txs_in_block={}, mempool_len={}, spent_outpoints={})",
+                            hex::encode(bh),
+                            accepted,
+                            txs_in_block,
+                            mp2.len(),
+                            mp2.spent_len(),
+                        );
+                    }
+                });
+            }
+
+            axum::serve(listener, app).await?;
+            Ok(())
+        }
+    }
+}
